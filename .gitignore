@@ -1,0 +1,9 @@
+.venv/
+.env.local
+__pycache__/
+*.pyc
+*.log
+.env
+wireguard/devices/
+!*.md
+!docs/

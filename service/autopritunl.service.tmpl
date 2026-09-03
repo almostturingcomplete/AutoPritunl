@@ -1,0 +1,15 @@
+[Unit]
+Description=AutoPritunl keepalive (Pritunl VPN with headless Google SSO)
+After=network-online.target pritunl-client.service
+Wants=network-online.target
+
+[Service]
+ExecStart=__ROOT__/bin/pvpn-keepalive
+Restart=always
+RestartSec=10
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+StandardOutput=append:__HOME__/.cache/glogin/keepalive.log
+StandardError=append:__HOME__/.cache/glogin/keepalive.log
+
+[Install]
+WantedBy=default.target

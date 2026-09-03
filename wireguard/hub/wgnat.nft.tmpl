@@ -1,0 +1,13 @@
+table ip wgnat
+delete table ip wgnat
+table ip wgnat {
+  chain postrouting {
+    type nat hook postrouting priority 100; policy accept;
+    ip saddr __WG_NET__.0/24 oifname "__TUN__" masquerade
+  }
+  chain forward {
+    type filter hook forward priority -10; policy accept;
+    iifname "wg0" oifname "__TUN__" accept
+    iifname "__TUN__" oifname "wg0" ct state related,established accept
+  }
+}
