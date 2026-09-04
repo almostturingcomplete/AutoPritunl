@@ -51,12 +51,24 @@ REPO
   grep -q '^PVPN_MODE=' .env.local 2>/dev/null || echo "PVPN_MODE=local" >> .env.local
 else
   command -v sshuttle >/dev/null || brew install sshuttle
-  if [ ! -f /etc/sudoers.d/sshuttle_auto ]; then
+  # sshuttle needs root for the pf firewall; without a matching NOPASSWD rule sudo asks for
+  # a password and the keepalive (no tty) just sees sshuttle exit with no output.
+  # Two fixes over `sshuttle --sudoers-no-modify` as-is:
+  #   - it appends the package dir to PYTHONPATH, but the process it spawns uses the
+  #     site-packages dir itself, so the generated rule never matches. Strip that segment.
+  #   - its Cmnd_Alias name is random; pin it so the file only changes when the paths do.
+  # Rewritten whenever it drifts: a Homebrew sshuttle or python bump moves the Cellar path
+  # and silently breaks the old rule.
+  SUDOERS_TMP="$(mktemp "${TMPDIR:-/tmp}/sshuttle_auto.XXXXXX")"
+  sshuttle --sudoers-no-modify \
+    | perl -pe 's{(PYTHONPATH=\S*?/site-packages)/sshuttle(\s)}{$1$2}; s{SSHUTTLE[0-9A-F]+}{SSHUTTLE_AUTOPRITUNL}g' \
+    > "$SUDOERS_TMP"
+  if ! sudo -n cmp -s "$SUDOERS_TMP" /etc/sudoers.d/sshuttle_auto 2>/dev/null; then
     echo "[install] sshuttle sudoers (Touch ID prompt)"
-    sshuttle --sudoers-no-modify | sudo tee /etc/sudoers.d/sshuttle_auto >/dev/null
-    sudo chmod 440 /etc/sudoers.d/sshuttle_auto
-    sudo visudo -cf /etc/sudoers.d/sshuttle_auto >/dev/null
+    sudo visudo -cf "$SUDOERS_TMP" >/dev/null
+    sudo install -m 440 -o root -g wheel "$SUDOERS_TMP" /etc/sudoers.d/sshuttle_auto
   fi
+  rm -f "$SUDOERS_TMP"
   BIN="$HOME/bin"; mkdir -p "$BIN"
 fi
 

@@ -51,7 +51,7 @@ class PvpnError(Exception):
 
 
 def log(msg):
-    print(f"[pvpn] {msg}", file=sys.stderr)
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [pvpn] {msg}", file=sys.stderr)
 
 
 def cfg(key, default=None):
@@ -247,8 +247,18 @@ def complete_sso(page, url):
     raise PvpnError(f"SSO not completed in {SSO_TIMEOUT_S}s; at {page.url}; see {glogin.CACHE/'pvpn-fail.png'}")
 
 
+def recent_client_logs(pid, since, limit=8):
+    """pritunl-client keeps its log across runs, so show only lines from this attempt:
+    otherwise a failure gets explained with yesterday's disconnect."""
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since))
+    fresh = [l for l in pc("logs", pid, check=False).splitlines()
+             if l[:4].isdigit() and l[:19] >= stamp]
+    return (fresh or ["(no client log lines since this attempt started)"])[-limit:]
+
+
 def wait_connected(pid):
-    deadline = time.time() + CONNECT_TIMEOUT_S
+    started = time.time()
+    deadline = started + CONNECT_TIMEOUT_S
     while time.time() < deadline:
         r = next((r for r in profiles() if r["id"] == pid), None)
         if connected(r):
@@ -256,8 +266,7 @@ def wait_connected(pid):
         if r and r["state"] != "Active":
             break
         time.sleep(2)
-    logs = pc("logs", pid, check=False).splitlines()[-8:]
-    raise PvpnError("not connected; last log lines:\n" + "\n".join(logs))
+    raise PvpnError("not connected; last log lines:\n" + "\n".join(recent_client_logs(pid, started)))
 
 
 def connect_local(name_sub=None, keep_gui=False, headed=False):
@@ -345,7 +354,15 @@ def connect_gateway():
     cmd += routes()
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        raise PvpnError(f"sshuttle failed: {r.stderr.strip()[-300:]}")
+        why = (r.stderr.strip() or r.stdout.strip())[-300:]
+        if not why or "sudo" in why.lower() or "password" in why.lower():
+            # sudo writes its prompt to /dev/tty, so under launchd a missing NOPASSWD rule
+            # looks like sshuttle exiting with nothing to say.
+            why = (why or f"exit {r.returncode}, no output") + (
+                "; sudo could not start the sshuttle firewall unattended - re-run "
+                "./install.sh to refresh /etc/sudoers.d/sshuttle_auto (it breaks on a "
+                "Homebrew sshuttle or python upgrade)")
+        raise PvpnError(f"sshuttle failed: {why}")
     time.sleep(1)
     pid = sshuttle_pid()
     if not pid:
