@@ -10,7 +10,10 @@ What it does:
   Bypasses the passkey prompt, handles the account chooser, exports cookies for reuse.
 - **Pritunl from the CLI** (`pvpn`): starts the profile with `pritunl-client`, completes the
   single-use SSO link headlessly, waits for the tunnel. Modes: `local`, `gateway`, `auto`.
-- **Keepalive service** (`pvpn-keepalive`): launchd on macOS, systemd on Linux, reconnects with backoff.
+- **Keepalive service** (`pvpn-keepalive`): launchd on macOS, systemd on Linux, reconnects with
+  backoff. Watches the attached network (interface, router, address) and reconnects within
+  5s of a wifi switch, ethernet plug or sleep/wake; holds quietly while the laptop is offline
+  instead of burning retries on the browser fallback.
 - **Gateway mode**: a VPS holds the VPN; laptops route only the VPN subnets through it
   with `sshuttle`, including DNS for the VPN's search domain. Phones use a WireGuard hub on
   the same VPS.
