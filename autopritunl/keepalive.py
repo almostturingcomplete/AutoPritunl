@@ -10,6 +10,7 @@ for the SSO fallback) while there is no network at all. So the loop watches the
 attached network and wakes immediately when it changes, and stays quiet offline.
 """
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -41,7 +42,8 @@ def net_fingerprint():
                 elif k == "gateway":
                     gw = v.strip()
         else:
-            out = subprocess.run(["ip", "-o", "route", "get", "1.1.1.1"],
+            ip = shutil.which("ip") or "/usr/sbin/ip"  # systemd user units get a short PATH
+            out = subprocess.run([ip, "-o", "route", "get", "1.1.1.1"],
                                  capture_output=True, text=True, timeout=5).stdout.split()
             if "dev" in out:
                 iface = out[out.index("dev") + 1]

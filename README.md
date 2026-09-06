@@ -13,7 +13,8 @@ What it does:
 - **Keepalive service** (`pvpn-keepalive`): launchd on macOS, systemd on Linux, reconnects with
   backoff. Watches the attached network (interface, router, address) and reconnects within
   5s of a wifi switch, ethernet plug or sleep/wake; holds quietly while the laptop is offline
-  instead of burning retries on the browser fallback.
+  instead of burning retries on the browser fallback. Checks that the tunnel actually
+  carries traffic, not just that a process is alive, and repairs it when it does not.
 - **Gateway mode**: a VPS holds the VPN; laptops route only the VPN subnets through it
   with `sshuttle`, including DNS for the VPN's search domain. Phones use a WireGuard hub on
   the same VPS.
@@ -82,6 +83,7 @@ Devices split-tunnel only `VPN_ROUTES` and use `VPN_DNS` for lookups.
 | `PRITUNL_PROFILE` | `pritunl://host/ku/...` link; these expire, so the file is preferred |
 | `VPN_ROUTES` | space-separated CIDRs the VPN pushes (gateway mode and WireGuard devices) |
 | `VPN_DNS`, `VPN_DOMAIN` | resolver and search domain pushed by the VPN |
+| `VPN_PROBE` | `host:port` inside the VPN the keepalive connects to to prove the tunnel carries traffic (default `VPN_DNS:53`) |
 | `VPN_TUN` | tunnel interface on the Linux gateway (`tun0`) |
 | `GATEWAY_HOST` | ssh alias of the gateway; empty = no gateway, local mode only |
 | `GATEWAY_INSTALL_DIR` | repo path on the gateway, relative to `$HOME` |
@@ -92,7 +94,7 @@ Devices split-tunnel only `VPN_ROUTES` and use `VPN_DNS` for lookups.
 | `WG_ENDPOINT`, `WG_SERVER_PUBKEY` | WireGuard hub public endpoint and key |
 
 Per-host overrides go in `.env.local` (same syntax, wins over `.env`, gitignored).
-Env var `AUTOPRITUNL_CACHE` moves the state directory (default `~/.cache/glogin`).
+Env var `AUTOPRITUNL_STATE` moves the state directory (default `~/.local/share/autopritunl`, migrated from the old `~/.cache/glogin`).
 
 ### Secrets: how to obtain them
 
@@ -135,7 +137,31 @@ pvpn-keepalive         the service loop (foreground)
 deploy-gateway.sh [host]          wireguard/hub/setup-hub.sh          wireguard/add-device.sh <name> <octet>
 ```
 
-Logs: `~/.cache/glogin/keepalive.log`. Failure screenshots: `~/.cache/glogin/*fail.png`.
+Logs: `~/.local/share/autopritunl/keepalive.log`. Failure screenshots: `~/.local/share/autopritunl/*fail.png`.
+
+## When it breaks
+
+Three failures cost real downtime here; each is now handled, and each leaves a named line in
+the log rather than a silent retry loop.
+
+- **sshuttle alive, tunnel dead.** macOS `pf` can hold sshuttle's rules, evaluate them
+  millions of times, and redirect nothing: `pass out route-to lo0` matches but no packet ever
+  reaches the redirector, so every connection to a VPN subnet just times out. An unclean
+  sshuttle exit leaving a dangling `pfctl -E` reference is enough to get there. The keepalive
+  probes `VPN_PROBE` each cycle; on failure it tears the tunnel down, flushes and reloads
+  `pf`, and rebuilds (~20s). `pvpn --status` says `carrying traffic` or `NOT carrying traffic`.
+- **Gateway VPN down.** The laptop now asks the gateway to reconnect itself over ssh
+  (a headless SSO there) instead of falling back to a browser login on the laptop.
+- **Profile stuck with no SSO link.** `pritunl-client start` prints the single-use SSO link
+  only for a profile that is stopped and not a *system profile*: with autostart enabled the
+  client refuses non-interactive SSO and prints nothing ("Stopping system profile due to
+  non-interactive single sign-on"), and started while still Active it prints nothing and then
+  fails with "Single sign-on timeout". `pvpn` waits for the profile to go Inactive and turns
+  autostart off - the keepalive is what starts it on boot anyway.
+
+State lives in `~/.local/share/autopritunl`, not `~/.cache`: the Google trusted-device profile
+and the exported Pritunl profile are not disposable, and a cache cleaner deleting them costs a
+manual `glogin` to recover.
 
 ## How it works, briefly
 

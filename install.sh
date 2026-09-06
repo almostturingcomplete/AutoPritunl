@@ -12,7 +12,7 @@ echo "[install] venv + playwright"
 [ -x .venv/bin/python ] || python3 -m venv .venv
 .venv/bin/pip install -q -r requirements.txt 2>&1 | grep -v notice || true
 .venv/bin/playwright install chromium 2>&1 | tail -1
-mkdir -p "$HOME/.cache/glogin"
+mkdir -p "$HOME/.local/share/autopritunl"
 
 if [ "$OS" = "Linux" ]; then
   if command -v dnf >/dev/null; then
@@ -69,6 +69,18 @@ else
     sudo install -m 440 -o root -g wheel "$SUDOERS_TMP" /etc/sudoers.d/sshuttle_auto
   fi
   rm -f "$SUDOERS_TMP"
+
+  # pvpn resets pf when sshuttle's rules are loaded but redirect nothing (an unclean
+  # sshuttle exit leaves a dangling `pfctl -E` reference and the tunnel silently
+  # blackholes). Only the three commands the repair needs, and only the system config.
+  PF_TMP="$(mktemp "${TMPDIR:-/tmp}/autopritunl_pf.XXXXXX")"
+  printf '%s ALL=(root) NOPASSWD: /sbin/pfctl -d, /sbin/pfctl -F all, /sbin/pfctl -f /etc/pf.conf\n' "$USER" > "$PF_TMP"
+  if ! sudo -n cmp -s "$PF_TMP" /etc/sudoers.d/autopritunl_pf 2>/dev/null; then
+    echo "[install] pf repair sudoers (Touch ID prompt)"
+    sudo visudo -cf "$PF_TMP" >/dev/null
+    sudo install -m 440 -o root -g wheel "$PF_TMP" /etc/sudoers.d/autopritunl_pf
+  fi
+  rm -f "$PF_TMP"
   BIN="$HOME/bin"; mkdir -p "$BIN"
 fi
 

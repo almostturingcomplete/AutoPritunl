@@ -8,8 +8,8 @@ ExecStart=__ROOT__/bin/pvpn-keepalive
 Restart=always
 RestartSec=10
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-StandardOutput=append:__HOME__/.cache/glogin/keepalive.log
-StandardError=append:__HOME__/.cache/glogin/keepalive.log
+StandardOutput=append:__HOME__/.local/share/autopritunl/keepalive.log
+StandardError=append:__HOME__/.local/share/autopritunl/keepalive.log
 
 [Install]
 WantedBy=default.target

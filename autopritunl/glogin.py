@@ -20,9 +20,9 @@ Usage:
                             elsewhere (e.g. copy the trusted Mac session to a server)
 
 Outputs:
-  ~/.cache/glogin/profile/      persistent Chromium profile (cookies survive runs)
-  ~/.cache/glogin/state.json    Playwright storage_state (cookies + localStorage)
-  ~/.cache/glogin/cookies.json  cookies only, list of dicts
+  ~/.local/share/autopritunl/profile/      persistent Chromium profile (survives runs)
+  ~/.local/share/autopritunl/state.json    Playwright storage_state (cookies + localStorage)
+  ~/.local/share/autopritunl/cookies.json  cookies only, list of dicts
 """
 import argparse
 import contextlib
@@ -40,7 +40,29 @@ from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
 
-CACHE = Path(os.environ.get("AUTOPRITUNL_CACHE", Path.home() / ".cache" / "glogin"))
+def _state_dir():
+    """Where the durable state lives: the Chromium profile Google trusts as a device, the
+    exported Pritunl profile, the session cookies. This used to be ~/.cache/glogin, but a
+    cache directory is by definition disposable - anything that cleans caches is entitled
+    to delete it, and one did, taking the trusted-device login with it. Keep it under
+    XDG_DATA_HOME instead, migrating an existing directory on first run."""
+    env = os.environ.get("AUTOPRITUNL_STATE") or os.environ.get("AUTOPRITUNL_CACHE")
+    if env:
+        return Path(os.path.expanduser(env))
+    new = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "autopritunl"
+    old = Path.home() / ".cache" / "glogin"
+    new.mkdir(parents=True, exist_ok=True)
+    # Move the contents, not the directory: the service writes its log into the new path
+    # before anything else runs, so the new directory usually exists but is empty.
+    if old.is_dir() and not (new / "profile").exists():
+        for item in old.iterdir():
+            target = new / item.name
+            if not target.exists():
+                shutil.move(str(item), str(target))
+    return new
+
+
+CACHE = _state_dir()
 PROFILE = CACHE / "profile"
 STATE = CACHE / "state.json"
 COOKIES = CACHE / "cookies.json"

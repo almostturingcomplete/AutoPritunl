@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -42,6 +43,7 @@ CANDIDATES = [
 ]
 GUI_PATTERNS = ["Pritunl.app/Contents/MacOS/Pritunl", "Pritunl Helper", "pritunl-client-electron"]
 CONNECT_TIMEOUT_S = 90
+GATEWAY_RECONNECT_TIMEOUT_S = 300
 SSO_TIMEOUT_S = 90
 SSHUTTLE_PID = glogin.CACHE / "sshuttle.pid"
 
@@ -180,13 +182,33 @@ def quit_gui():
     time.sleep(2)
 
 
-def start_and_get_sso(pid):
+def stop_and_settle(pid, timeout=30):
+    """`start` on a profile that is still Active returns silently, without an SSO link;
+    the client then waits for an authentication that never arrives and gives up with
+    "Single sign-on timeout". So wait for the profile to actually go Inactive first."""
     pc("stop", pid, check=False)
-    time.sleep(1.5)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = next((r for r in profiles() if r["id"] == pid), None)
+        if not r or r["state"] != "Active":
+            return True
+        time.sleep(1)
+    return False
+
+
+def start_and_get_sso(pid):
+    if not stop_and_settle(pid):
+        log("profile still Active after stop; starting anyway")
+    # Autostart makes this a "system profile", and the client refuses to run single
+    # sign-on for one non-interactively: it stops the profile and prints nothing
+    # ("Stopping system profile due to non-interactive single sign-on"). The keepalive
+    # is what starts us on boot, so autostart buys nothing here.
+    pc("disable", pid, check=False)
     out = pc("start", pid)
     m = re.search(r"https://\S+", out)
     if not m:
-        log(out.strip() or "started (no SSO link printed)")
+        log(f"no SSO link printed (start said {out.strip()!r}); waiting to see if the "
+            "profile connects without one")
         return None
     return m.group(0)
 
@@ -330,6 +352,58 @@ def sshuttle_pid():
         return None
 
 
+def probe_target():
+    """host:port that is only reachable through the VPN, used to prove the tunnel
+    actually carries traffic. Defaults to the VPN resolver."""
+    t = cfg("VPN_PROBE", "")
+    if t:
+        host, _, port = t.partition(":")
+        return host, int(port or 53)
+    return (vpn_dns(), 53) if vpn_dns() else None
+
+
+def tunnel_ok(timeout=5):
+    """A live sshuttle process is not proof of a working tunnel. macOS pf can end up with
+    sshuttle's rules loaded and evaluated but redirecting nothing - every connection then
+    just times out - so check that something inside the VPN is actually reachable."""
+    t = probe_target()
+    if not t:
+        return True
+    try:
+        socket.create_connection(t, timeout).close()
+        return True
+    except OSError:
+        return False
+
+
+def reset_pf():
+    """sshuttle enables pf with `pfctl -E` and releases it with a token on exit. An
+    unclean exit leaves the reference and the anchors behind, and a later run loads its
+    rules into a ruleset that no longer routes to the redirector. Flushing pf and
+    reloading /etc/pf.conf clears that; it is what the system does at boot anyway."""
+    if sys.platform != "darwin":
+        return
+    for args in (["-d"], ["-F", "all"], ["-f", "/etc/pf.conf"]):
+        r = subprocess.run(["sudo", "-n", "/sbin/pfctl", *args], capture_output=True, text=True)
+        if r.returncode != 0 and "not enabled" not in (r.stderr or ""):
+            log(f"pfctl {' '.join(args)}: {r.stderr.strip()[-120:] or 'failed'}"
+                " (re-run ./install.sh to allow it unattended)")
+            return
+    log("reset pf")
+
+
+def gateway_reconnect():
+    """The gateway holds the VPN. If its tunnel dropped, have it reconnect itself: that
+    is a headless SSO on the gateway, not a browser login on this laptop."""
+    log(f"asking {gateway_host()} to reconnect its VPN")
+    d = cfg("GATEWAY_INSTALL_DIR", "Projects/AutoPritunl")
+    r = subprocess.run(ssh_base() + [gateway_host(), f"cd {d} && ./bin/pvpn --local"],
+                       capture_output=True, text=True, timeout=GATEWAY_RECONNECT_TIMEOUT_S)
+    if r.returncode != 0:
+        log(f"gateway could not reconnect: {(r.stderr or r.stdout).strip()[-200:]}")
+    return r.returncode == 0
+
+
 def connect_gateway():
     if sshuttle_pid():
         return sshuttle_pid()
@@ -342,7 +416,10 @@ def connect_gateway():
     if not reachable:
         raise PvpnError(f"gateway {gateway_host()} not reachable over ssh")
     if not gw:
-        raise PvpnError(f"gateway {gateway_host()} reachable but its VPN is not connected")
+        if gateway_reconnect():
+            reachable, gw = gateway_status()
+        if not gw:
+            raise PvpnError(f"gateway {gateway_host()} reachable but its VPN is not connected")
     stop_local()  # avoid duplicate routes
     glogin.CACHE.mkdir(parents=True, exist_ok=True)
     cmd = [exe, "-r", gateway_host(), "--daemon", "--pidfile", str(SSHUTTLE_PID),
@@ -367,6 +444,17 @@ def connect_gateway():
     pid = sshuttle_pid()
     if not pid:
         raise PvpnError("sshuttle exited immediately; check sudoers (install.sh) and ssh access")
+    if not tunnel_ok():
+        log("sshuttle is up but nothing routes through it; resetting pf and retrying")
+        stop_gateway()
+        reset_pf()
+        subprocess.run(cmd, capture_output=True, text=True)
+        time.sleep(1)
+        pid = sshuttle_pid()
+        if not pid or not tunnel_ok():
+            stop_gateway()
+            raise PvpnError(f"tunnel not carrying traffic after a pf reset "
+                            f"(probe {probe_target()}); routes may have changed")
     log(f"gateway up via {gateway_host()} ({gw['client']}), sshuttle pid {pid}")
     return pid
 
@@ -397,8 +485,10 @@ def ensure(mode="auto", name_sub=None, keep_gui=False, headed=False):
     # auto
     if sshuttle_pid():
         reachable, gw = gateway_status()
-        if reachable and gw:
+        if reachable and gw and tunnel_ok():
             return f"gateway via {gateway_host()} (up)"
+        if reachable and gw:
+            log("sshuttle running but the tunnel carries no traffic; rebuilding")
         stop_gateway()
     try:
         connect_gateway()
@@ -415,7 +505,12 @@ def status():
     except PvpnError as e:
         print(f"local: {e}")
     pid = sshuttle_pid()
-    print(f"sshuttle: {'pid ' + str(pid) if pid else 'down'}")
+    if pid:
+        t = probe_target()
+        ok = "carrying traffic" if tunnel_ok() else f"NOT carrying traffic (probe {t[0]}:{t[1]})"
+        print(f"sshuttle: pid {pid}, {ok}")
+    else:
+        print("sshuttle: down")
     if not gateway_host():
         print("gateway: not configured (GATEWAY_HOST)")
         return
