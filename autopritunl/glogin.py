@@ -18,8 +18,13 @@ Usage:
   glogin.py --fresh         wipe profile and log in from scratch
   glogin.py --import-state F  seed the profile with cookies from a state.json exported
                             elsewhere (e.g. copy the trusted Mac session to a server)
+  glogin.py --account NAME  use a second Google account: its own Chromium profile under
+                            <state>/accounts/NAME/ and its own credentials from
+                            ~/.config/glogin/NAME.env (or --env FILE). Accepts either
+                            GMAIL/GPASS/GTOTP or EMAIL/PASSWORD/TOTP_KEY key names.
+  glogin.py --accounts      list configured accounts
 
-Outputs:
+Outputs (default account; --account NAME nests these under accounts/NAME/):
   ~/.local/share/autopritunl/profile/      persistent Chromium profile (survives runs)
   ~/.local/share/autopritunl/state.json    Playwright storage_state (cookies + localStorage)
   ~/.local/share/autopritunl/cookies.json  cookies only, list of dicts
@@ -29,6 +34,7 @@ import contextlib
 import fcntl
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -70,6 +76,58 @@ ROOT = Path(__file__).resolve().parents[1]
 ENV_FILE = ROOT / ".env"
 if not ENV_FILE.exists():
     ENV_FILE = Path.home() / ".config" / "glogin.env"
+ACCOUNTS = CACHE / "accounts"
+ACCOUNT_ENV_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "glogin"
+ACCOUNT = None          # None = the original single-account layout, untouched
+ACCOUNT_ENV = None      # extra env file layered on top of .env for that account
+
+
+def slug(name):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "default"
+
+
+def list_accounts():
+    """(name, env_file_or_None, profile_exists) for every configured extra account."""
+    names = set()
+    if ACCOUNT_ENV_DIR.is_dir():
+        names |= {f.stem for f in ACCOUNT_ENV_DIR.glob("*.env")}
+    if ACCOUNTS.is_dir():
+        names |= {d.name for d in ACCOUNTS.iterdir() if d.is_dir()}
+    out = []
+    for n in sorted(names):
+        env = ACCOUNT_ENV_DIR / f"{n}.env"
+        out.append((n, env if env.exists() else None, (ACCOUNTS / n / "profile").exists()))
+    return out
+
+
+def use_account(name=None, env_file=None):
+    """Point the module at one account's own profile, state and credentials.
+
+    The default account keeps the original paths so existing trusted sessions, pvpn and
+    the keepalive service are unaffected; every other account gets its own subtree under
+    <state>/accounts/<name>/ because Google ties the remembered-device cookie to a
+    profile, and one profile cannot hold two signed-in identities for our purposes."""
+    global ACCOUNT, ACCOUNT_ENV, CACHE, PROFILE, STATE, COOKIES
+    name = name or os.environ.get("GLOGIN_ACCOUNT") or ""
+    env_file = env_file or os.environ.get("GLOGIN_ENV") or ""
+    if env_file:
+        env_file = Path(os.path.expanduser(env_file))
+        if not env_file.exists():
+            sys.exit(f"no such env file: {env_file}")
+        name = name or env_file.stem
+    if not name or name in ("default", "primary"):
+        ACCOUNT, ACCOUNT_ENV = None, None
+        return None
+    ACCOUNT = slug(name)
+    ACCOUNT_ENV = Path(env_file) if env_file else ACCOUNT_ENV_DIR / f"{ACCOUNT}.env"
+    CACHE = ACCOUNTS / ACCOUNT
+    PROFILE = CACHE / "profile"
+    STATE = CACHE / "state.json"
+    COOKIES = CACHE / "cookies.json"
+    CACHE.mkdir(parents=True, exist_ok=True)
+    return ACCOUNT
+
+
 LOGIN_URL = "https://accounts.google.com/ServiceLogin?continue=https://myaccount.google.com/"
 OK_URL = "myaccount.google.com"
 
@@ -93,6 +151,13 @@ NO_WEBAUTHN = ("delete window.PublicKeyCredential; "
                "Object.defineProperty(navigator, 'credentials', {get: () => undefined});")
 
 
+# Second-account env files are often written with plain names; accept both spellings.
+ALIASES = {
+    "EMAIL": "GMAIL", "PASSWORD": "GPASS", "TOTP_KEY": "GTOTP",
+    "TOTP_SECRET": "GTOTP", "BACKUP_CODES": "GBACKUP",
+}
+
+
 def _read_env(path, override):
     if not path.exists():
         return
@@ -101,19 +166,26 @@ def _read_env(path, override):
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
+        k = k.strip()
+        k = ALIASES.get(k, k)
         v = v.strip().strip('"').strip("'")
         if override:
-            os.environ[k.strip()] = v
+            os.environ[k] = v
         else:
-            os.environ.setdefault(k.strip(), v)
+            os.environ.setdefault(k, v)
 
 
 def load_env():
     _read_env(ENV_FILE, override=False)
     _read_env(ROOT / ".env.local", override=True)  # per-machine overrides, gitignored
+    if ACCOUNT_ENV:
+        # override: the shared .env has already set the primary account's credentials
+        if not ACCOUNT_ENV.exists():
+            sys.exit(f"account {ACCOUNT!r} has no credentials at {ACCOUNT_ENV}")
+        _read_env(ACCOUNT_ENV, override=True)
     missing = [k for k in ("GMAIL", "GPASS", "GTOTP") if not os.environ.get(k)]
     if missing:
-        sys.exit(f"missing config: {', '.join(missing)} (edit {ENV_FILE})")
+        sys.exit(f"missing config: {', '.join(missing)} (edit {ACCOUNT_ENV or ENV_FILE})")
 
 
 def totp():
@@ -347,8 +419,18 @@ def main():
     ap.add_argument("--headed", action="store_true")
     ap.add_argument("--fresh", action="store_true")
     ap.add_argument("--import-state")
+    ap.add_argument("--account", help="named second account (own profile + credentials)")
+    ap.add_argument("--env", help="credentials file for --account (default ~/.config/glogin/<name>.env)")
+    ap.add_argument("--accounts", action="store_true", help="list configured accounts")
     a = ap.parse_args()
 
+    if a.accounts:
+        print(f"{'default':<20} {ENV_FILE}  profile={'yes' if PROFILE.exists() else 'no'}")
+        for name, env, has_profile in list_accounts():
+            print(f"{name:<20} {env or '(no env file)'}  profile={'yes' if has_profile else 'no'}")
+        return
+
+    use_account(a.account, a.env)
     load_env()
     if a.totp:
         print(totp())
