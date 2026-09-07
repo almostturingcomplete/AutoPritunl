@@ -17,6 +17,10 @@ Usage:
                             link in your default browser and burns it)
   pvpn --headed             show the browser during SSO
   pvpn --routes             print the VPN subnets used for gateway mode
+  pvpn --pin-host           re-pin the Pritunl server in /etc/hosts so it stays
+                            resolvable while the tunnel (and its resolver) is down
+  pvpn --restart-service    restart pritunl-service, which wedges into a permanent
+                            "Connecting" that stopping the profile does not clear
 
 Works on macOS and Linux (pritunl-client CLI + pritunl-service, no GUI needed).
 """
@@ -81,6 +85,105 @@ def gateway_host():
 
 def vpn_dns():
     return cfg("VPN_DNS", "")
+
+
+# ------------------------------------------------------- keeping the server resolvable
+
+PIN_BIN = "/usr/local/sbin/autopritunl-pin-host"
+PUBLIC_RESOLVERS = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
+
+
+def pritunl_host():
+    """The Pritunl server: it serves the profile sync and is the OpenVPN remote. Its name
+    sits inside VPN_DOMAIN, so the VPN resolver claims it - see ensure_host_pinned."""
+    return cfg("PRITUNL_HOST") or urlparse(cfg("PRITUNL_PROFILE", "")).hostname
+
+
+def _public_ipv4(ip):
+    """The pin exists for the case where the tunnel is down, so an inside address is
+    worse than no answer: it would point the client at something it cannot reach."""
+    try:
+        a, b = (int(x) for x in ip.split(".")[:2])
+    except ValueError:
+        return False
+    return not (a in (0, 10, 127) or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168))
+
+
+def resolve_offtunnel(host):
+    """Resolve without going through the system resolver, which would hand this query to
+    /etc/resolver/<VPN_DOMAIN> and so to a nameserver that only exists inside the tunnel.
+    Public resolvers first; a restrictive network that blocks them still has its own."""
+    servers = list(PUBLIC_RESOLVERS)
+    r = subprocess.run(["route", "-n", "get", "default"], capture_output=True, text=True)
+    m = re.search(r"gateway:\s*(\d+\.\d+\.\d+\.\d+)", r.stdout)
+    if m:
+        servers.append(m.group(1))
+    for s in servers:
+        out = subprocess.run(["dig", "+short", "+time=2", "+tries=1", "A", host, f"@{s}"],
+                             capture_output=True, text=True).stdout
+        for line in out.split():
+            if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", line) and _public_ipv4(line):
+                return line
+    return None
+
+
+def hosts_pin(host):
+    try:
+        for line in Path("/etc/hosts").read_text().splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and not line.startswith("#") and host in fields[1:]:
+                return fields[0]
+    except OSError:
+        pass
+    return None
+
+
+def ensure_host_pinned():
+    """Keep the Pritunl server resolvable while the tunnel is down.
+
+    install.sh sends all of VPN_DOMAIN to the VPN resolver, and the server's own name is
+    inside VPN_DOMAIN. With the tunnel down that name does not resolve, so the client
+    cannot reach the server, so the tunnel cannot come back: local mode deadlocks and
+    every retry fails the same way. /etc/hosts is read before the resolvers, so a pin
+    there is the way out. Refresh it whenever we can still see public DNS."""
+    host = pritunl_host()
+    if not host:
+        return None
+    have = hosts_pin(host)
+    ip = resolve_offtunnel(host)
+    if not ip:
+        if not have:
+            log(f"cannot resolve {host} off-tunnel and it is not pinned in /etc/hosts; "
+                "local mode will not be able to connect")
+        return have
+    if ip == have:
+        return have
+    r = subprocess.run(["sudo", "-n", PIN_BIN, host, ip], capture_output=True, text=True)
+    if r.returncode != 0:
+        log(f"could not pin {host} -> {ip}: {(r.stderr or r.stdout).strip()[-140:] or 'failed'}"
+            " (re-run ./install.sh to allow it unattended)")
+        return have
+    log(f"pinned {host} -> {ip} in /etc/hosts")
+    return ip
+
+
+def restart_client_service():
+    """The pritunl service wedges: the profile sits in Connecting for ever, `start` prints
+    no SSO link, and the service writes nothing to its own log. Stopping the profile does
+    not clear it - only restarting the service does."""
+    if sys.platform == "darwin":
+        cmd = ["sudo", "-n", "/bin/launchctl", "kickstart", "-k", "system/com.pritunl.service"]
+    else:
+        cmd = ["sudo", "-n", "/bin/systemctl", "restart", "pritunl-client.service"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        log(f"could not restart the pritunl service: "
+            f"{(r.stderr or r.stdout).strip()[-140:] or 'failed'}"
+            " (re-run ./install.sh to allow it unattended)")
+        return False
+    time.sleep(3)
+    log("restarted the pritunl service")
+    return True
 
 
 # ---------------------------------------------------------------- local pritunl
@@ -298,6 +401,9 @@ def connect_local(name_sub=None, keep_gui=False, headed=False):
     if connected(p):
         return p
     glogin.load_env()
+    # Before anything else: without this the client cannot even resolve the server it is
+    # about to dial, and the failure looks like a silent `start` rather than a DNS problem.
+    ensure_host_pinned()
     if not keep_gui:
         quit_gui()
     # Browser + Google session first: the SSO link is single-use and the client
@@ -534,11 +640,18 @@ def main():
     ap.add_argument("--profile")
     ap.add_argument("--keep-gui", action="store_true")
     ap.add_argument("--headed", action="store_true")
+    ap.add_argument("--pin-host", action="store_true")
+    ap.add_argument("--restart-service", action="store_true")
     a = ap.parse_args()
     glogin.load_env() if (glogin.ENV_FILE.exists()) else None
     try:
         if a.routes:
             print(" ".join(routes()))
+        elif a.pin_host:
+            host = pritunl_host()
+            print(f"{host} -> {ensure_host_pinned() or 'not pinned'}")
+        elif a.restart_service:
+            sys.exit(0 if restart_client_service() else 1)
         elif a.status:
             status()
         elif a.add:

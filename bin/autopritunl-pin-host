@@ -1,0 +1,38 @@
+#!/bin/sh
+# Pin one hostname to one address in /etc/hosts.
+#
+# install.sh points VPN_DOMAIN at the VPN resolver (/etc/resolver/<domain>), which only
+# answers through the tunnel. The Pritunl server's own name lives inside that domain, so
+# the moment the tunnel drops, the name the client needs in order to rebuild the tunnel
+# stops resolving - the client can never dial back in. /etc/hosts is consulted before the
+# resolvers, so a pin here is what breaks that deadlock.
+#
+# Runs as root from a NOPASSWD sudoers rule, so it takes exactly two arguments and
+# validates both before it touches /etc/hosts.
+set -eu
+
+HOSTS=/etc/hosts
+TAG="# autopritunl-pin"
+
+host=${1:-}
+ip=${2:-}
+case "$host" in
+    '' | *[!A-Za-z0-9.-]* | -* ) echo "bad hostname: $host" >&2; exit 2 ;;
+esac
+case "$ip" in
+    '' | *[!0-9.]* ) echo "bad address: $ip" >&2; exit 2 ;;
+esac
+
+# Same filesystem as /etc/hosts, so the swap below is atomic: a half-written /etc/hosts
+# would take name resolution down for the whole machine, not just the VPN.
+tmp=$(mktemp /etc/.autopritunl-hosts.XXXXXX)
+trap 'rm -f "$tmp"' EXIT
+grep -v "$TAG $host\$" "$HOSTS" > "$tmp" || true
+printf '%s\t%s\t%s %s\n' "$ip" "$host" "$TAG" "$host" >> "$tmp"
+chown root:wheel "$tmp"
+chmod 644 "$tmp"
+mv "$tmp" "$HOSTS"
+trap - EXIT
+
+dscacheutil -flushcache 2>/dev/null || true
+killall -HUP mDNSResponder 2>/dev/null || true

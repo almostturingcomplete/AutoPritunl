@@ -90,6 +90,20 @@ def wait(seconds, net):
             return cur, True
 
 
+def escalate(fails, mode):
+    """Retrying the same broken path is what turned one gateway outage into a whole day
+    without a tunnel: the loop failed identically every two minutes and repaired nothing.
+    Each further consecutive failure now buys one repair, cheapest and safest first, and
+    each runs once per outage rather than on every retry."""
+    if fails == 2:
+        # The server's name lives inside VPN_DOMAIN, whose resolver is behind the tunnel.
+        pvpn.ensure_host_pinned()
+    elif fails == 3 and mode in ("auto", "local"):
+        pvpn.restart_client_service()
+    elif fails == 4:
+        pvpn.reset_pf()
+
+
 def main():
     if glogin.ENV_FILE.exists():
         glogin.load_env()
@@ -123,12 +137,14 @@ def main():
             wait_s = min(MAX_BACKOFF_S, 15 * 2 ** min(fails, 5))
             pvpn.log(f"down ({e}); retry in {wait_s}s")
             last = None
+            escalate(fails, mode)
             net, changed = wait(wait_s, net)
         except Exception as e:  # never die; launchd/systemd would just restart us anyway
             fails += 1
             wait_s = min(MAX_BACKOFF_S, 15 * 2 ** min(fails, 5))
             pvpn.log(f"error {type(e).__name__}: {e}; retry in {wait_s}s")
             last = None
+            escalate(fails, mode)
             net, changed = wait(wait_s, net)
         if changed:
             # A tunnel built on the old link is dead even when its process is alive:

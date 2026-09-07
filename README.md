@@ -132,6 +132,8 @@ glogin --fresh         wipe the browser profile and log in from scratch
 pvpn                   connect in PVPN_MODE           pvpn --local / --gateway   force a mode
 pvpn --status          local table, sshuttle, gateway  pvpn --stop                disconnect all
 pvpn --add             import the profile              pvpn --routes              print VPN_ROUTES
+pvpn --pin-host        keep the Pritunl server resolvable while the tunnel is down
+pvpn --restart-service clear a wedged pritunl-service (stuck "Connecting", no SSO link)
 pvpn-keepalive         the service loop (foreground)
 
 deploy-gateway.sh [host]          wireguard/hub/setup-hub.sh          wireguard/add-device.sh <name> <octet>
@@ -141,8 +143,21 @@ Logs: `~/.local/share/autopritunl/keepalive.log`. Failure screenshots: `~/.local
 
 ## When it breaks
 
-Three failures cost real downtime here; each is now handled, and each leaves a named line in
+Five failures cost real downtime here; each is now handled, and each leaves a named line in
 the log rather than a silent retry loop.
+
+- **Split DNS eats the VPN server's own name.** `/etc/resolver/<VPN_DOMAIN>` sends the whole
+  domain to `VPN_DNS`, which only answers through the tunnel - and the Pritunl server is
+  itself inside `VPN_DOMAIN`. With the tunnel down, the name needed to rebuild the tunnel
+  stops resolving, so local mode can never recover: every retry dies identically, and
+  `pritunl-client start` prints nothing at all. `/etc/hosts` is read before the resolvers, so
+  `pvpn --pin-host` pins that one name there, refreshed from public DNS (never from the
+  tunnel-side resolver, and private answers are rejected - a pin to an inside address would
+  be worse than none). Runs on every local connect and from the keepalive's second failure.
+- **pritunl-service wedged.** The profile sits in `Connecting` for ever, `start` returns
+  nothing, and the service writes nothing to `/var/log/pritunl-client.log`. Stopping the
+  profile does not clear it; only `pvpn --restart-service` does. The keepalive fires it on
+  the third consecutive failure.
 
 - **sshuttle alive, tunnel dead.** macOS `pf` can hold sshuttle's rules, evaluate them
   millions of times, and redirect nothing: `pass out route-to lo0` matches but no packet ever

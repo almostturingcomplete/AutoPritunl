@@ -92,6 +92,31 @@ if [ "$OS" = "Darwin" ] && [ -n "$VPN_DNS" ] && [ -n "$VPN_DOMAIN" ]; then
     sudo mkdir -p /etc/resolver
     printf 'nameserver %s\n' "$VPN_DNS" | sudo tee "/etc/resolver/$VPN_DOMAIN" >/dev/null
   fi
+
+  # That resolver only answers through the tunnel, and the Pritunl server's own name is
+  # inside VPN_DOMAIN - so with the tunnel down the client cannot resolve the server it
+  # needs in order to rebuild the tunnel, and local mode deadlocks. Pin that one name in
+  # /etc/hosts (read before the resolvers) and let pvpn refresh the pin unattended.
+  PIN_BIN=/usr/local/sbin/autopritunl-pin-host
+  if ! sudo -n cmp -s bin/autopritunl-pin-host "$PIN_BIN" 2>/dev/null; then
+    echo "[install] $PIN_BIN (sudo)"
+    sudo install -d -m 755 -o root -g wheel /usr/local/sbin
+    sudo install -m 755 -o root -g wheel bin/autopritunl-pin-host "$PIN_BIN"
+  fi
+  # Plus the one fixed command that clears a wedged pritunl-service ("Connecting" for
+  # ever, `start` printing no SSO link, nothing in its own log).
+  PIN_TMP="$(mktemp "${TMPDIR:-/tmp}/autopritunl_pin.XXXXXX")"
+  {
+    printf '%s ALL=(root) NOPASSWD: %s\n' "$USER" "$PIN_BIN"
+    printf '%s ALL=(root) NOPASSWD: /bin/launchctl kickstart -k system/com.pritunl.service\n' "$USER"
+  } > "$PIN_TMP"
+  if ! sudo -n cmp -s "$PIN_TMP" /etc/sudoers.d/autopritunl_pin 2>/dev/null; then
+    echo "[install] pin-host + service-restart sudoers (Touch ID prompt)"
+    sudo visudo -cf "$PIN_TMP" >/dev/null
+    sudo install -m 440 -o root -g wheel "$PIN_TMP" /etc/sudoers.d/autopritunl_pin
+  fi
+  rm -f "$PIN_TMP"
+  ./bin/pvpn --pin-host || echo "[install] could not pin the Pritunl host yet (needs network)"
 fi
 
 for n in glogin pvpn pvpn-keepalive; do ln -sf "$ROOT/bin/$n" "$BIN/$n"; done
