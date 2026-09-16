@@ -36,6 +36,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -341,41 +342,75 @@ def do_login(page, manual=False):
         sys.exit(f"login did not reach {OK_URL}; at {page.url}; see {CACHE/'fail.png'}")
 
 
+LOCK_WAIT_S = 120
+
+
+def _lock_profile():
+    """One Chromium on this profile at a time. A plain blocking flock wedged the keepalive
+    for 12 hours once: a failed launch had leaked the previous lock descriptor inside the
+    same process, and the next flock() waited on it for ever, with nothing in the log.
+    Poll with a deadline instead, so a stuck lock becomes an error the caller can log."""
+    lock = open(CACHE / "browser.lock", "w")
+    deadline = time.time() + LOCK_WAIT_S
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock
+        except OSError:
+            if time.time() >= deadline:
+                lock.close()
+                raise RuntimeError(f"{CACHE / 'browser.lock'} held for over {LOCK_WAIT_S}s "
+                                   "(another glogin/pvpn on this profile, or a stale lock)")
+            time.sleep(1)
+
+
+def _launch(p, headless):
+    kw = dict(headless=headless, channel="chromium", user_agent=UA, locale="en-US",
+              viewport={"width": 1280, "height": 860},
+              args=["--disable-blink-features=AutomationControlled"])
+    try:
+        return p.chromium.launch_persistent_context(str(PROFILE), **kw)
+    except Exception as e:
+        if "Executable doesn't exist" not in str(e):
+            raise
+        # bin/* keep the browsers under .venv, out of ~/Library/Caches, after a cache
+        # cleaner deleted them once. Whatever the location, put them back.
+        log("Chromium is missing; installing it (playwright install chromium)")
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
+                       check=True, capture_output=True, text=True, timeout=300)
+        return p.chromium.launch_persistent_context(str(PROFILE), **kw)
+
+
 @contextlib.contextmanager
 def browser(headless=True):
     """Yield (ctx, page) on the persistent, stealthed, WebAuthn-less profile."""
     CACHE.mkdir(parents=True, exist_ok=True)
-    lock = open(CACHE / "browser.lock", "w")
-    fcntl.flock(lock, fcntl.LOCK_EX)  # one Chromium on this profile at a time
-    stealth = Stealth(
-        navigator_platform_override="MacIntel",
-        navigator_user_agent_override=UA,
-        sec_ch_ua_override=SEC_CH_UA,
-        navigator_vendor_override="Google Inc.",
-        webgl_vendor_override="Google Inc. (Apple)",
-        webgl_renderer_override="ANGLE (Apple, ANGLE Metal Renderer: Apple M4, Unspecified Version)",
-    )
-    with stealth.use_sync(sync_playwright()) as p:
-        ctx = p.chromium.launch_persistent_context(
-            str(PROFILE),
-            headless=headless,
-            channel="chromium",
-            user_agent=UA,
-            locale="en-US",
-            viewport={"width": 1280, "height": 860},
-            args=["--disable-blink-features=AutomationControlled"],
+    lock = _lock_profile()
+    try:
+        stealth = Stealth(
+            navigator_platform_override="MacIntel",
+            navigator_user_agent_override=UA,
+            sec_ch_ua_override=SEC_CH_UA,
+            navigator_vendor_override="Google Inc.",
+            webgl_vendor_override="Google Inc. (Apple)",
+            webgl_renderer_override="ANGLE (Apple, ANGLE Metal Renderer: Apple M4, Unspecified Version)",
         )
-        ctx.add_init_script(NO_WEBAUTHN)
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        try:
-            yield ctx, page
-        finally:
+        with stealth.use_sync(sync_playwright()) as p:
+            ctx = _launch(p, headless)
+            ctx.add_init_script(NO_WEBAUTHN)
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
             try:
-                ctx.close()
-            except Exception:
-                pass
-            fcntl.flock(lock, fcntl.LOCK_UN)
-            lock.close()
+                yield ctx, page
+            finally:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+    finally:
+        # Released here, not only after a successful launch: a launch that raised used
+        # to skip the release, and the descriptor it leaked kept the lock held.
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
 
 
 def ensure_login(page, manual=False):

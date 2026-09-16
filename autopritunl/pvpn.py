@@ -204,8 +204,12 @@ def client_bin():
     return _PC
 
 
-def pc(*args, check=True):
-    r = subprocess.run([client_bin(), *args], capture_output=True, text=True)
+def pc(*args, check=True, timeout=60):
+    try:
+        r = subprocess.run([client_bin(), *args], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise PvpnError(f"pritunl-client {' '.join(args)} hung for {timeout}s "
+                        "(service wedged? pvpn --restart-service)")
     if check and r.returncode != 0:
         raise PvpnError(f"pritunl-client {' '.join(args)} failed: {r.stderr.strip() or r.stdout.strip()}")
     return r.stdout
@@ -438,7 +442,12 @@ def ssh_base():
 
 def gateway_status():
     """Return (reachable, connected_row_or_None)."""
-    r = subprocess.run(ssh_base() + [gateway_host(), "pritunl-client list"], capture_output=True, text=True)
+    try:
+        # ConnectTimeout covers the dial only; a session that dies mid-command would wait for ever.
+        r = subprocess.run(ssh_base() + [gateway_host(), "pritunl-client list"],
+                           capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return False, None
     if r.returncode != 0:
         return False, None
     for line in r.stdout.splitlines():
@@ -510,6 +519,13 @@ def gateway_reconnect():
     return r.returncode == 0
 
 
+def run_sshuttle(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise PvpnError("sshuttle did not daemonize within 60s (sudo waiting for a password?)")
+
+
 def connect_gateway():
     if sshuttle_pid():
         return sshuttle_pid()
@@ -535,7 +551,7 @@ def connect_gateway():
         # written by install.sh) are captured and answered through the gateway's tunnel.
         cmd += ["--ns-hosts", vpn_dns(), "--to-ns", vpn_dns()]
     cmd += routes()
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = run_sshuttle(cmd)
     if r.returncode != 0:
         why = (r.stderr.strip() or r.stdout.strip())[-300:]
         if not why or "sudo" in why.lower() or "password" in why.lower():
@@ -554,7 +570,7 @@ def connect_gateway():
         log("sshuttle is up but nothing routes through it; resetting pf and retrying")
         stop_gateway()
         reset_pf()
-        subprocess.run(cmd, capture_output=True, text=True)
+        run_sshuttle(cmd)
         time.sleep(1)
         pid = sshuttle_pid()
         if not pid or not tunnel_ok():

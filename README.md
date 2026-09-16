@@ -143,7 +143,7 @@ Logs: `~/.local/share/autopritunl/keepalive.log`. Failure screenshots: `~/.local
 
 ## When it breaks
 
-Five failures cost real downtime here; each is now handled, and each leaves a named line in
+Six failures cost real downtime here; each is now handled, and each leaves a named line in
 the log rather than a silent retry loop.
 
 - **Split DNS eats the VPN server's own name.** `/etc/resolver/<VPN_DOMAIN>` sends the whole
@@ -167,6 +167,15 @@ the log rather than a silent retry loop.
   `pf`, and rebuilds (~20s). `pvpn --status` says `carrying traffic` or `NOT carrying traffic`.
 - **Gateway VPN down.** The laptop now asks the gateway to reconnect itself over ssh
   (a headless SSO there) instead of falling back to a browser login on the laptop.
+- **Keepalive alive but doing nothing.** `browser()` took a blocking `flock` on the
+  profile lock. One Chromium launch failed (a cache cleaner had deleted
+  `~/Library/Caches/ms-playwright`) and leaked the lock descriptor inside the keepalive
+  process; the next local-mode attempt then blocked on its own lock for 12 hours with no
+  log line, while launchd saw a live process. Now the lock is polled with a deadline and
+  released on every exit path, the browsers live under `.venv/ms-playwright` and are
+  reinstalled when missing, `pritunl-client`, ssh and sshuttle calls have timeouts, and a
+  watchdog thread exits the keepalive when one cycle runs past 20 minutes so the service
+  manager restarts it (`ensure() has been running for Ns` in the log).
 - **Profile stuck with no SSO link.** `pritunl-client start` prints the single-use SSO link
   only for a profile that is stopped and not a *system profile*: with autostart enabled the
   client refuses non-interactive SSO and prints nothing ("Stopping system profile due to

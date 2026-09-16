@@ -1,3 +1,5 @@
 #!/bin/sh
 ROOT="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)"
+# Browsers live in the venv, not ~/Library/Caches or ~/.cache: a cache cleaner deleted them once.
+export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$ROOT/.venv/ms-playwright}"
 exec "$ROOT/.venv/bin/python" "$ROOT/autopritunl/glogin.py" "$@"

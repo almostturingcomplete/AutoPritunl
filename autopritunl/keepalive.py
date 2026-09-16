@@ -14,6 +14,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -24,6 +25,9 @@ import pvpn  # noqa: E402
 SLICE_S = 5  # granularity of the interruptible sleep
 OFFLINE_RETRY_S = 10
 MAX_BACKOFF_S = 120
+# One ensure() must finish inside this: gateway reconnect (300s) + browser lock wait +
+# a Chromium reinstall + Google login + SSO + connect wait come to about 15 minutes.
+HANG_S = 1200
 PROBES = [("1.1.1.1", 443), ("8.8.8.8", 443)]  # 443, not 53: many networks block outbound DNS
 
 
@@ -104,6 +108,22 @@ def escalate(fails, mode):
         pvpn.reset_pf()
 
 
+def watchdog(busy):
+    """ensure() can block for ever: a lock, an ssh session that dies mid-command, a
+    pritunl-client call into a wedged service. The loop cannot catch that (the loop is
+    what is blocked), launchd sees a live process, and the log stays empty: the tunnel
+    was down for 12 hours that way once. Exit instead. The service manager restarts us,
+    and a fresh process holds no stale locks or pipes."""
+    while True:
+        time.sleep(SLICE_S)
+        since = busy.get("since")
+        if since and time.time() - since > HANG_S:
+            pvpn.log(f"ensure() has been running for {int(time.time() - since)}s; "
+                     "exiting so the service restarts it")
+            sys.stderr.flush()
+            os._exit(3)
+
+
 def main():
     if glogin.ENV_FILE.exists():
         glogin.load_env()
@@ -113,6 +133,8 @@ def main():
     last = None
     fails = 0
     was_offline = False
+    busy = {}
+    threading.Thread(target=watchdog, args=(busy,), daemon=True).start()
     pvpn.log(f"keepalive start mode={mode} interval={interval}s net={net}")
     while True:
         changed = False
@@ -126,7 +148,11 @@ def main():
             if was_offline:
                 pvpn.log("online again")
                 was_offline = False
-            state = pvpn.ensure(mode)
+            busy["since"] = time.time()
+            try:
+                state = pvpn.ensure(mode)
+            finally:
+                busy["since"] = None
             fails = 0
             if state != last:
                 pvpn.log(f"up: {state}")

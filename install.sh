@@ -5,6 +5,7 @@ set -e
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 OS="$(uname -s)"
 cd "$ROOT"
+export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$ROOT/.venv/ms-playwright}"  # same as bin/*
 [ -f .env ] || { echo "copy .env.example to .env and fill it in first"; exit 1; }
 LABEL="$(sed -n 's/^SERVICE_LABEL=//p' .env)"; LABEL="${LABEL:-com.autopritunl.keepalive}"
 
