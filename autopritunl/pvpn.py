@@ -440,15 +440,28 @@ def ssh_base():
     return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new"]
 
 
-def gateway_status():
-    """Return (reachable, connected_row_or_None)."""
-    try:
-        # ConnectTimeout covers the dial only; a session that dies mid-command would wait for ever.
-        r = subprocess.run(ssh_base() + [gateway_host(), "pritunl-client list"],
-                           capture_output=True, text=True, timeout=30)
-    except subprocess.TimeoutExpired:
-        return False, None
-    if r.returncode != 0:
+def gateway_status(retries=1):
+    """Return (reachable, connected_row_or_None).
+
+    ssh exit 255 is a transport failure: DNS, route, timeout. Right after a wifi switch
+    those clear within seconds, but one such failure used to count as "gateway down" and
+    send auto mode into the local fallback, which takes two minutes to fail. So the
+    connect path asks for a few retries before believing it."""
+    r = None
+    for i in range(retries):
+        try:
+            # ConnectTimeout covers the dial only; a session that dies mid-command would wait for ever.
+            r = subprocess.run(ssh_base() + [gateway_host(), "pritunl-client list"],
+                               capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            r = None
+        if r is not None and r.returncode != 255:
+            break
+        if i + 1 < retries:
+            time.sleep(5)
+    if r is None or r.returncode != 0:
+        why = "timeout" if r is None else ((r.stderr.strip().splitlines() or [f"exit {r.returncode}"])[-1])
+        log(f"gateway ssh failed ({retries} tries): {why[:120]}")
         return False, None
     for line in r.stdout.splitlines():
         if line.startswith("|") and "ID" not in line.split("|")[1]:
@@ -534,7 +547,7 @@ def connect_gateway():
         raise PvpnError("sshuttle not installed (brew install sshuttle / apt install sshuttle)")
     if not gateway_host():
         raise PvpnError("GATEWAY_HOST not set")
-    reachable, gw = gateway_status()
+    reachable, gw = gateway_status(retries=4)
     if not reachable:
         raise PvpnError(f"gateway {gateway_host()} not reachable over ssh")
     if not gw:
