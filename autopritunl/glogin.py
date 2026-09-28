@@ -264,9 +264,25 @@ def do_login(page, manual=False):
         page.screenshot(path=str(CACHE / "fail.png"))
         sys.exit(f"no email input or account chooser at {page.url}; see {CACHE/'fail.png'}")
 
-    # password
+    # password. Google sometimes puts a "Verify it's you ... sign in again" page
+    # (/v3/signin/confirmidentifier) in front of it: the address is shown as text, the
+    # only control is Next. Seen 2026-09-28 on both hosts; it took the tunnel down.
     log("password")
-    page.wait_for_selector(PASS_SEL, state="visible", timeout=30000)
+    for _ in range(3):
+        if first_visible(page, [PASS_SEL], timeout=6000):
+            break
+        nxt = first_visible(page, ["#identifierNext", "button:has-text('Next')",
+                                   "button:has-text('Continue')"], timeout=1500)
+        if not nxt:
+            break
+        log("interstitial, clicking Next")
+        page.locator(nxt).first.click()
+        page.wait_for_timeout(2500)
+    try:
+        page.wait_for_selector(PASS_SEL, state="visible", timeout=30000)
+    except PWTimeout:
+        page.screenshot(path=str(CACHE / "fail.png"))
+        sys.exit(f"no password field at {page.url}; see {CACHE/'fail.png'}")
     page.wait_for_timeout(500)
     page.fill(PASS_SEL, os.environ["GPASS"])
     page.keyboard.press("Enter")
