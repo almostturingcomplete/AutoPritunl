@@ -197,6 +197,30 @@ def log(msg):
     print(f"[glogin] {msg}", file=sys.stderr)
 
 
+NEXT_SEL = ["#identifierNext", "button:has-text('Next')", "button:has-text('Continue')"]
+
+
+def reach(page, wanted, done=None, steps=3, timeout=6000):
+    """Wait for one of `wanted` (or `done()` to be true), clicking through any page that
+    offers only a Next/Continue button on the way. Google inserts such pages at will:
+    "Verify it's you ... sign in again" (/v3/signin/confirmidentifier) turned up between
+    the account chooser and the password on 2026-09-28 and took the tunnel down, and the
+    same shape can appear before 2FA. Returns the selector found, or True for done()."""
+    for _ in range(steps + 1):
+        sel = first_visible(page, wanted, timeout=timeout)
+        if sel:
+            return sel
+        if done and done():
+            return True
+        nxt = first_visible(page, NEXT_SEL, timeout=1500)
+        if not nxt:
+            return None
+        log("interstitial, clicking Next")
+        page.locator(nxt).first.click()
+        page.wait_for_timeout(2500)
+    return None
+
+
 def first_visible(page, selectors, timeout=8000):
     """Return the first selector that becomes visible, or None."""
     deadline = time.time() + timeout / 1000
@@ -264,23 +288,9 @@ def do_login(page, manual=False):
         page.screenshot(path=str(CACHE / "fail.png"))
         sys.exit(f"no email input or account chooser at {page.url}; see {CACHE/'fail.png'}")
 
-    # password. Google sometimes puts a "Verify it's you ... sign in again" page
-    # (/v3/signin/confirmidentifier) in front of it: the address is shown as text, the
-    # only control is Next. Seen 2026-09-28 on both hosts; it took the tunnel down.
+    # password
     log("password")
-    for _ in range(3):
-        if first_visible(page, [PASS_SEL], timeout=6000):
-            break
-        nxt = first_visible(page, ["#identifierNext", "button:has-text('Next')",
-                                   "button:has-text('Continue')"], timeout=1500)
-        if not nxt:
-            break
-        log("interstitial, clicking Next")
-        page.locator(nxt).first.click()
-        page.wait_for_timeout(2500)
-    try:
-        page.wait_for_selector(PASS_SEL, state="visible", timeout=30000)
-    except PWTimeout:
+    if not reach(page, [PASS_SEL]):
         page.screenshot(path=str(CACHE / "fail.png"))
         sys.exit(f"no password field at {page.url}; see {CACHE/'fail.png'}")
     page.wait_for_timeout(500)
@@ -305,6 +315,11 @@ def do_login(page, manual=False):
         if settled():
             break
         page.wait_for_timeout(500)
+    if at_ok(page):
+        return
+    if not first_visible(page, [totp_sel], timeout=500):
+        reach(page, [totp_sel, "text=Try another way", "text=More options"],
+              done=lambda: at_ok(page), timeout=3000)
     if at_ok(page):
         return
     if not first_visible(page, [totp_sel], timeout=1000):
