@@ -114,12 +114,30 @@ def resolve_offtunnel(host):
     /etc/resolver/<VPN_DOMAIN> and so to a nameserver that only exists inside the tunnel.
     Public resolvers first; a restrictive network that blocks them still has its own."""
     servers = list(PUBLIC_RESOLVERS)
-    r = subprocess.run(["route", "-n", "get", "default"], capture_output=True, text=True)
-    m = re.search(r"gateway:\s*(\d+\.\d+\.\d+\.\d+)", r.stdout)
-    if m:
-        servers.append(m.group(1))
+    try:
+        if sys.platform == "darwin":
+            r = subprocess.run(["route", "-n", "get", "default"], capture_output=True, text=True)
+            m = re.search(r"gateway:\s*(\d+\.\d+\.\d+\.\d+)", r.stdout)
+        else:  # Linux has no `route` by default; this crashed every connect on the gateway
+            ip = shutil.which("ip") or "/usr/sbin/ip"
+            r = subprocess.run([ip, "-o", "route", "show", "default"], capture_output=True, text=True)
+            m = re.search(r"via\s+(\d+\.\d+\.\d+\.\d+)", r.stdout)
+        if m:
+            servers.append(m.group(1))
+    except OSError:
+        pass
+    dig = shutil.which("dig")
+    if not dig:
+        # No bind-utils: the system resolver has to do, filtered to public answers.
+        try:
+            for info in socket.getaddrinfo(host, None, socket.AF_INET):
+                if _public_ipv4(info[4][0]):
+                    return info[4][0]
+        except OSError:
+            pass
+        return None
     for s in servers:
-        out = subprocess.run(["dig", "+short", "+time=2", "+tries=1", "A", host, f"@{s}"],
+        out = subprocess.run([dig, "+short", "+time=2", "+tries=1", "A", host, f"@{s}"],
                              capture_output=True, text=True).stdout
         for line in out.split():
             if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", line) and _public_ipv4(line):
